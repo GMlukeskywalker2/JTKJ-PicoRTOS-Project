@@ -59,6 +59,8 @@ const MorseEntry morse_table[] = {
     {';', "-.-.-."}, {'=', "-...-"},  {'+', ".-.-."}, {'_', "..--.-"},
     {'"', ".-..-."}, {'$', "...-..-"}, {'@', ".--.-."}
 };
+//// Convert character to Morse codem,returns a cahr that is in morse
+const char* to_morse(char c);
 
 // Convert character to Morse code
 const char* to_morse(char c) {
@@ -384,4 +386,5 @@ int main() {
     // Never reach this line.
     return 0;
 }
+
 
