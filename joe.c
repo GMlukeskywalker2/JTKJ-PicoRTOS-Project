@@ -1,3 +1,20 @@
+/**
+ * Morse Code Project with FreeRTOS on Raspberry Pi Pico
+ * -----------------------------------------------------
+ * Features:
+ *  - Encode ASCII text to Morse
+ *  - Decode Morse back to ASCII
+ *  - Use accelerometer pitch to generate Morse symbols
+ *  - Output via LED, OLED, and buzzer
+ *  - FreeRTOS tasks for sensor, input, and output
+ *
+ * Improvements:
+ *  - Safer buffer handling
+ *  - Clearer enums and constants
+ *  - Proper task priorities
+ *  - Queue handling with timeout
+ *  - Function headers for clarity
+ */
 
 #include <stdio.h>
 #include <string.h>
@@ -5,248 +22,235 @@
 #include <stdlib.h>
 #include <pico/stdlib.h>
 #include <math.h>
-
 #include <FreeRTOS.h>
 #include <queue.h>
 #include <task.h>
-
 #include "tkjhat/sdk.h"
-
 #include <ctype.h>
 
-
-
-
+// -------------------- Constants --------------------
 #define DEFAULT_STACK_SIZE 2048
-#define CDC_ITF_TX      1
-#define UNIT 200  // base time unit in milliseconds
+#define CDC_ITF_TX         1
+#define UNIT               200   // base time unit in ms
 
+// Morse timing constants
+#define DOT_UNITS          1
+#define DASH_UNITS         3
+#define LETTER_GAP         3
+#define WORD_GAP           7
 
+// Angle threshold for accelerometer input
+#define ANGLE_THRESHOLD    10.0f
 
-enum state { WAITING=1,RUNNING=0};
+// Task priorities
+#define PRIORITY_SENSOR    3
+#define PRIORITY_RECEIVE   2
+#define PRIORITY_PRINT     1
+
+// -------------------- Enums --------------------
+enum state { WAITING = 0, RUNNING = 1 };
+enum mode  { SENDING = 0, RECEIVING = 1, DECODING = 2 };
+
 enum state programState = WAITING;
-enum mode { RECEIVING=1,SENDING=0,DECODING=2};
-enum mode programMode = SENDING;
+enum mode  programMode  = SENDING;
 
-
-char input_buffer[100];  // Temporary input buffer
+// -------------------- Buffers --------------------
+char input_buffer[100];  
 char morse_string[600] = "";
-//char decoded_buffer[256];  // Adjust size as needed
 
+// -------------------- FreeRTOS Queue --------------------
 QueueHandle_t morseQueue;
 
+// -------------------- Morse Table --------------------
 typedef struct {
     char symbol;
     const char* code;
 } MorseEntry;
 
 const MorseEntry morse_table[] = {
-    // Letters
-    {'A', ".-"},    {'B', "-..."},  {'C', "-.-."},  {'D', "-.."},   {'E', "."},
-    {'F', "..-."},  {'G', "--."},   {'H', "...."},  {'I', ".."},    {'J', ".---"},
-    {'K', "-.-"},   {'L', ".-.."},  {'M', "--"},    {'N', "-."},    {'O', "---"},
-    {'P', ".--."},  {'Q', "--.-"},  {'R', ".-."},   {'S', "..."},   {'T', "-"},
-    {'U', "..-"},   {'V', "...-"},  {'W', ".--"},   {'X', "-..-"},  {'Y', "-.--"},
+    {'A', ".-"}, {'B', "-..."}, {'C', "-.-."}, {'D', "-.."}, {'E', "."},
+    {'F', "..-."}, {'G', "--."}, {'H', "...."}, {'I', ".."}, {'J', ".---"},
+    {'K', "-.-"}, {'L', ".-.."}, {'M', "--"}, {'N', "-."}, {'O', "---"},
+    {'P', ".--."}, {'Q', "--.-"}, {'R', ".-."}, {'S', "..."}, {'T', "-"},
+    {'U', "..-"}, {'V', "...-"}, {'W', ".--"}, {'X', "-..-"}, {'Y', "-.--"},
     {'Z', "--.."},
-
-    // Digits
     {'0', "-----"}, {'1', ".----"}, {'2', "..---"}, {'3', "...--"}, {'4', "....-"},
     {'5', "....."}, {'6', "-...."}, {'7', "--..."}, {'8', "---.."}, {'9', "----."},
-
-    // Punctuation
     {',', "--..--"}, {'?', "..--.."}, {'!', "-.-.--"}, {'\'', ".----."},
-    {'/', "-..-."},  {'(', "-.--."},  {')', "-.--.-"}, {'&', ".-..."},  {':', "---..."},
-    {';', "-.-.-."}, {'=', "-...-"},  {'+', ".-.-."}, {'_', "..--.-"},
+    {'/', "-..-."}, {'(', "-.--."}, {')', "-.--.-"}, {'&', ".-..."}, {':', "---..."},
+    {';', "-.-.-."}, {'=', "-...-"}, {'+', ".-.-."}, {'_', "..--.-"},
     {'"', ".-..-."}, {'$', "...-..-"}, {'@', ".--.-."}
 };
-//// Convert character to Morse codem,returns a cahr that is in morse
+
+// -------------------- Function Headers --------------------
+/** Convert character to Morse code string */
 const char* to_morse(char c);
 
-// Convert character to Morse code
+/** Encode ASCII string into Morse string */
+void encode_to_morse(const char* input);
+
+/** Convert Morse code string to ASCII character */
+char from_morse(const char* code);
+
+/** Decode Morse string into ASCII output */
+void decode_from_morse(const char* morse_input, char* output_buffer);
+
+/** Convert pitch angle to Morse symbol */
+char morse_from_angle(float angle);
+
+/** Play buzzer theme */
+void play_theme(void);
+
+/** Print Morse string to OLED, LED, and buzzer */
+void print_morse_output(void);
+
+/** Calculate pitch from accelerometer data */
+float calculate_pitch(float ax, float ay, float az);
+
+/** Button interrupt handler */
+static void btn_fxn(uint gpio, uint32_t eventMask);
+
+/** Sensor task: reads accelerometer and sends Morse symbols */
+static void sensor_task(void *arg);
+
+/** Receive task: handles user input (ASCII or Morse) */
+void receive_task(void *arg);
+
+/** Print task: consumes queue and outputs Morse */
+static void print_task(void *arg);
+
+/** Main entry point */
+int main(void);
+
+// -------------------- Function Implementations --------------------
 const char* to_morse(char c) {
     c = toupper((unsigned char)c);
     for (int i = 0; i < sizeof(morse_table) / sizeof(MorseEntry); i++) {
-        if (morse_table[i].symbol == c) {
-            return morse_table[i].code;
-        }
+        if (morse_table[i].symbol == c) return morse_table[i].code;
     }
-    return ""; // unsupported character
+    return ""; 
 }
 
-
-
-// Encode input_buffer into morse_string
 void encode_to_morse(const char* input) {
-    morse_string[0] = '\0';  // Clear previous content
+    morse_string[0] = '\0';
     for (size_t i = 0; i < strlen(input); i++) {
         const char* morse = to_morse(input[i]);
-        strcat(morse_string, morse);
-        strcat(morse_string, " ");  // Space between Morse characters
+        strncat(morse_string, morse, sizeof(morse_string) - strlen(morse_string) - 1);
+        strncat(morse_string, " ", sizeof(morse_string) - strlen(morse_string) - 1);
     }
 }
 
-// Convert Morse code to character
 char from_morse(const char* code) {
     for (int i = 0; i < sizeof(morse_table) / sizeof(MorseEntry); i++) {
-        if (strcmp(morse_table[i].code, code) == 0) {
-            return morse_table[i].symbol;
-        }
+        if (strcmp(morse_table[i].code, code) == 0) return morse_table[i].symbol;
     }
-    return '?'; // Unknown Morse code
+    return '?';
 }
 
 void decode_from_morse(const char* morse_input, char* output_buffer) {
     output_buffer[0] = '\0';
     char token[10];
     size_t out_index = 0;
-
     const char* p = morse_input;
+
     while (*p) {
         size_t i = 0;
-
-        // Extract Morse token
-        while (*p && *p != ' ' && i < sizeof(token) - 1) {
-            token[i++] = *p++;
-        }
+        while (*p && *p != ' ' && i < sizeof(token) - 1) token[i++] = *p++;
         token[i] = '\0';
+        if (i > 0) output_buffer[out_index++] = from_morse(token);
 
-        if (i > 0) {
-            output_buffer[out_index++] = from_morse(token);
-        }
-
-        // Count spaces
         int space_count = 0;
-        while (*p == ' ') {
-            space_count++;
-            p++;
-        }
-
-        // If two or more spaces, insert a space between words
-        if (space_count >= 2 && out_index < sizeof(morse_string) - 1) {
-            output_buffer[out_index++] = ' ';
-        }
+        while (*p == ' ') { space_count++; p++; }
+        if (space_count >= 2 && out_index < sizeof(morse_string) - 1) output_buffer[out_index++] = ' ';
     }
-
     output_buffer[out_index] = '\0';
 }
 
-// Convert pitch angle to Morse symbol
 char morse_from_angle(float angle) {
-    if (angle > 10) {
-        return '-';
-    } else if (angle < -10) {
-        return '.';
-    } else {
-        return ' ';
-    }
+    if (angle > ANGLE_THRESHOLD) return '-';
+    else if (angle < -ANGLE_THRESHOLD) return '.';
+    else return ' ';
 }
-void play_theme() {
-    buzzer_play_tone(659, 150);  // E5
-    sleep_ms(50);
-    buzzer_play_tone(784, 150);  // G5
-    sleep_ms(50);
-    buzzer_play_tone(880, 150);  // A5
-    sleep_ms(100);
-    buzzer_play_tone(1046, 200); // C6
-    sleep_ms(100);
-    buzzer_play_tone(880, 150);  // A5
-    sleep_ms(50);
-    buzzer_play_tone(784, 150);  // G5
-    sleep_ms(50);
-    buzzer_play_tone(659, 300);  // E5
-}
-void print() {
-        if((rand() % 6) + 1 == 6){
-            play_theme(); 
-                              }
-                        printf("\nMorse word: %s\n", morse_string);
-                          // OLED DISPLAY
-                        clear_display();
-                        write_text(morse_string);
-                             for (int i = 0; morse_string[i] != '\0'; i++) {
-                                if (morse_string[i] == '.') {
-                                    printf("\nDot at index %d\n", i);
-                                    toggle_led();           // LED ON
-                                    sleep_ms(UNIT);         // 1 unit ON
-                                    toggle_led();           // LED OFF
-                                    sleep_ms(UNIT);         // 1 unit gap
-                                    printf("\nLED blinked for dot\n");
-                                } else if (morse_string[i]  == '-') {
-                                    printf("\nDash at index %d\n", i);
-                                    toggle_led();           // LED ON
-                                    sleep_ms(UNIT * 3);     // 3 units ON
-                                    toggle_led();           // LED OFF
-                                    sleep_ms(UNIT);         // 1 unit gap
-                                    printf("\nLED blinked for dash\n");
 
-                            }else if (morse_string[i] == ' ') {
-            printf("\nSpace at index %d\n", i);
-            sleep_ms(UNIT * 3);     // Inter-character gap
+void play_theme(void) {
+    buzzer_play_tone(659, 150); sleep_ms(50);
+    buzzer_play_tone(784, 150); sleep_ms(50);
+    buzzer_play_tone(880, 150); sleep_ms(100);
+    buzzer_play_tone(1046, 200); sleep_ms(100);
+    buzzer_play_tone(880, 150); sleep_ms(50);
+    buzzer_play_tone(784, 150); sleep_ms(50);
+    buzzer_play_tone(659, 300);
+}
+
+void print_morse_output(void) {
+    if ((rand() % 6) + 1 == 6) play_theme();
+    printf("\nMorse word: %s\n", morse_string);
+    clear_display();
+    write_text(morse_string);
+
+    for (int i = 0; morse_string[i] != '\0'; i++) {
+        if (morse_string[i] == '.') {
+            toggle_led(); sleep_ms(UNIT * DOT_UNITS);
+            toggle_led(); sleep_ms(UNIT);
+        } else if (morse_string[i] == '-') {
+            toggle_led(); sleep_ms(UNIT * DASH_UNITS);
+            toggle_led(); sleep_ms(UNIT);
+        } else if (morse_string[i] == ' ') {
+            sleep_ms(UNIT * WORD_GAP);
         }
     }
 }
 
-// Calculate pitch from accelerometer data
 float calculate_pitch(float ax, float ay, float az) {
     return atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / M_PI;
 }
 
 static void btn_fxn(uint gpio, uint32_t eventMask) {
-    if (gpio == BUTTON1 ) {
+    if (gpio == BUTTON1) {
         programState = RUNNING;
-        if(programMode != SENDING){
+        if (programMode != SENDING) {
             programMode = SENDING;
             morse_string[0] = '\0';
         }
     }
-
-       if (gpio == BUTTON2 ) {
-        if(programMode == SENDING || programMode==DECODING){
+    if (gpio == BUTTON2) {
+        if (programMode == SENDING || programMode == DECODING) {
             programMode = RECEIVING;
-        printf("Now receiving \n");
-        }else{
-        programMode = DECODING;
-        printf("Now Decoding \n");
+            printf("Now receiving, use ASCII\n");
+        } else {
+            programMode = DECODING;
+            printf("Now decoding, use Morse\n");
         }
     }
-
 }
 
-static void sensor_task(void *arg){
+static void sensor_task(void *arg) {
     (void)arg;
     float ax, ay, az, gx, gy, gz, temp;
-        // Setting up the sensor. 
+
+    // Initialize sensor
     if (init_ICM42670() == 0) {
         printf("ICM-42670P initialized successfully!\n");
-        if (ICM42670_start_with_default_values() != 0){
-            printf("ICM-42670P could not initialize accelerometer or gyroscope");
+        if (ICM42670_start_with_default_values() != 0) {
+            printf("ICM-42670P could not initialize accelerometer or gyroscope\n");
         }
-        /*int _enablegyro = ICM42670_enable_accel_gyro_ln_mode();
-        printf ("Enable gyro: %d\n",_enablegyro);
-        int _gyro = ICM42670_startGyro(ICM42670_GYRO_ODR_DEFAULT, ICM42670_GYRO_FSR_DEFAULT);
-        printf ("Gyro return:  %d\n", _gyro);
-        int _accel = ICM42670_startAccel(ICM42670_ACCEL_ODR_DEFAULT, ICM42670_ACCEL_FSR_DEFAULT);
-        printf ("Accel return:  %d\n", _accel);*/
     } else {
         printf("Failed to initialize ICM-42670P.\n");
     }
 
-   
-    for(;;){
+    for (;;) {
+        if (programMode == SENDING) {
+            ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &temp);
+            float pitch = calculate_pitch(ax, ay, az);
+            char symbol = morse_from_angle(pitch);
+            printf("Pitch: %.2f  Symbol: %c\n", pitch, symbol);
 
-    if(programMode == SENDING){
-        ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &temp);
-        //printf("x:%f,y:%f,z:%f,temp:%f \n",ax,ay,az,temp);
-        float pitch = calculate_pitch(ax, ay, az);
-        char symbol  = morse_from_angle(pitch);
-        printf("Position: %.2f  symbol : %c\n", pitch , symbol);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        xQueueSend(morseQueue, &symbol, portMAX_DELAY);
-    }
-
-
-        // Do not remove this
-        vTaskDelay(pdMS_TO_TICKS(1000));
+            // Send symbol to queue safely
+            if (xQueueSend(morseQueue, &symbol, pdMS_TO_TICKS(100)) != pdPASS) {
+                printf("Queue full, symbol dropped\n");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(500)); // consistent delay
     }
 }
 
@@ -260,131 +264,96 @@ void receive_task(void *arg) {
             if (c != PICO_ERROR_TIMEOUT) {
                 if (c == '\r') continue;
                 if (c == '\n') {
-                    input_buffer[index] = '\0';  // End input string
+                    input_buffer[index] = '\0';
 
                     if (programMode == RECEIVING) {
-                        encode_to_morse(input_buffer);  // Convert to Morse
-                        print();  // Output morse_string
+                        encode_to_morse(input_buffer);
+                        print_morse_output();
                     } else if (programMode == DECODING) {
-                        decode_from_morse(input_buffer, morse_string);  // Convert Morse to text
-                        printf("Decoded: %s\n", morse_string);  // Output decoded text
-                        print();
+                        decode_from_morse(input_buffer, morse_string);
+                        printf("Decoded: %s\n", morse_string);
+                        print_morse_output();
                     }
-
                     index = 0;
                 } else if (index < sizeof(input_buffer) - 1) {
                     input_buffer[index++] = (char)c;
                 } else {
-                    index = 0;  // overflow protection
+                    index = 0; // overflow protection
                 }
             }
         }
-
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
-
-// Print task
-// Print task: updates OLED, LED, buffer
 static void print_task(void *arg) {
     (void)arg;
     char symbol;
 
     for (;;) {
         if (xQueueReceive(morseQueue, &symbol, portMAX_DELAY) && programMode == SENDING) {
-
             if (programState == RUNNING) {
                 programState = WAITING;
                 int length = strlen(morse_string);
 
-
-                // Append symbol to string
                 if (symbol != ' ') {
                     morse_string[length] = symbol;
                     morse_string[length + 1] = '\0';
-                  // Print to serial
                     printf("Symbol: %c  Buffer: %s\n", symbol, morse_string);
-              
                 } else {
                     if (length > 0) {
-                        print();
-                        }
-                        morse_string[0] = '\0';
-
+                        print_morse_output();
                     }
-                }
-
+                    morse_string[0] = '\0';
                 }
             }
-        
-
         }
+    }
+}
 
-
-        
-
-int main() {
-     // Seed the random number generator with current time
-    srand(time(NULL));
+int main(void) {
+    srand(time(NULL)); // seed RNG
 
     stdio_init_all();
     init_hat_sdk();
-    sleep_ms(300); //Wait some time so initialization of USB and hat is done.
-    init_display();          // SSD1306 ready to use
+    sleep_ms(300); // allow USB + hat init
+    init_display();
     clear_display();
     gpio_init(LED1);
-    gpio_set_dir(LED1, GPIO_OUT);    
-    gpio_init(BUTTON1); 
-    gpio_init(BUTTON2); 
-    gpio_set_irq_enabled_with_callback(BUTTON1, GPIO_IRQ_EDGE_FALL, true, btn_fxn);    
-    gpio_set_irq_enabled_with_callback(BUTTON2, GPIO_IRQ_EDGE_FALL, true, btn_fxn);    
-    init_buzzer();      
+    gpio_set_dir(LED1, GPIO_OUT);
+    gpio_init(BUTTON1);
+    gpio_init(BUTTON2);
+    gpio_set_irq_enabled_with_callback(BUTTON1, GPIO_IRQ_EDGE_FALL, true, btn_fxn);
+    gpio_set_irq_enabled_with_callback(BUTTON2, GPIO_IRQ_EDGE_FALL, true, btn_fxn);
+    init_buzzer();
 
     morseQueue = xQueueCreate(10, sizeof(char));
     if (morseQueue == NULL) {
         printf("Failed to create Morse queue\n");
         return 1;
     }
-    TaskHandle_t hSensorTask, hPrintTask,hReceiveTask, hUSB = NULL;
 
+    TaskHandle_t hSensorTask, hPrintTask, hReceiveTask;
 
-
-    // Create the tasks with xTaskCreate
-    BaseType_t result = xTaskCreate(sensor_task, // (en) Task function
-                "sensor",                        // (en) Name of the task 
-                DEFAULT_STACK_SIZE,              // (en) Size of the stack for this task (in words). Generally 1024 or 2048
-                NULL,                            // (en) Arguments of the task 
-                2,                               // (en) Priority of this task
-                &hSensorTask);                   // (en) A handle to control the execution of this task
-
-    if(result != pdPASS) {
+    if (xTaskCreate(sensor_task, "sensor", DEFAULT_STACK_SIZE, NULL,
+                    PRIORITY_SENSOR, &hSensorTask) != pdPASS) {
         printf("Sensor task creation failed\n");
         return 0;
     }
-    result = xTaskCreate(print_task,  // (en) Task function
-                "print",              // (en) Name of the task 
-                DEFAULT_STACK_SIZE,   // (en) Size of the stack for this task (in words). Generally 1024 or 2048
-                NULL,                 // (en) Arguments of the task 
-                2,                    // (en) Priority of this task
-                &hPrintTask);         // (en) A handle to control the execution of this task
 
-    if(result != pdPASS) {
-        printf("Print Task creation failed\n");
+    if (xTaskCreate(print_task, "print", DEFAULT_STACK_SIZE, NULL,
+                    PRIORITY_PRINT, &hPrintTask) != pdPASS) {
+        printf("Print task creation failed\n");
         return 0;
     }
-        result = xTaskCreate(receive_task,  // (en) Task function
-                "receive",             // (en) Name of the task 
-                DEFAULT_STACK_SIZE,   // (en) Size of the stack for this task (in words). Generally 1024 or 2048
-                NULL,                 // (en) Arguments of the task 
-                2,                    // (en) Priority of this task
-                &hReceiveTask);         // (en) A handle to control the execution of this task
 
-    // Start the scheduler (never returns)
+    if (xTaskCreate(receive_task, "receive", DEFAULT_STACK_SIZE, NULL,
+                    PRIORITY_RECEIVE, &hReceiveTask) != pdPASS) {
+        printf("Receive task creation failed\n");
+        return 0;
+    }
+
+    // Start scheduler (never returns)
     vTaskStartScheduler();
-    
-    // Never reach this line.
-    return 0;
+    return 0; // should never reach
 }
-
-
