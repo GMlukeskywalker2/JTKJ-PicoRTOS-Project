@@ -50,14 +50,16 @@
 // -------------------- Enums --------------------
 enum state { WAITING = 0, RUNNING = 1 };
 enum mode  { SENDING = 0, RECEIVING = 1, DECODING = 2 };
+enum mode2  { OFF = 0, ON = 1};
 
 enum state programState = WAITING;
 enum mode  programMode  = SENDING;
+enum mode2  usbMode = OFF;
 
 // -------------------- Buffers --------------------
 char input_buffer[100];  
 char morse_string[600] = "";
-
+char uart_rx_buffer[600];
 // -------------------- FreeRTOS Queue --------------------
 QueueHandle_t morseQueue;
 
@@ -173,15 +175,24 @@ char morse_from_angle(float angle) {
 }
 
 void play_theme(void) {
-    buzzer_play_tone(659, 150); sleep_ms(50);
-    buzzer_play_tone(784, 150); sleep_ms(50);
-    buzzer_play_tone(880, 150); sleep_ms(100);
-    buzzer_play_tone(1046, 200); sleep_ms(100);
-    buzzer_play_tone(880, 150); sleep_ms(50);
-    buzzer_play_tone(784, 150); sleep_ms(50);
+    buzzer_play_tone(659, 150); vTaskDelay(pdMS_TO_TICKS(50));
+    buzzer_play_tone(784, 150); vTaskDelay(pdMS_TO_TICKS(50));
+    buzzer_play_tone(880, 150); vTaskDelay(pdMS_TO_TICKS(100));
+    buzzer_play_tone(1046, 200); vTaskDelay(pdMS_TO_TICKS(100));
+    buzzer_play_tone(880, 150); vTaskDelay(pdMS_TO_TICKS(50));
+    buzzer_play_tone(784, 150); vTaskDelay(pdMS_TO_TICKS(50));
     buzzer_play_tone(659, 300);
 }
+// Send a string to the other Pico via UART
+void send_string_to_pico(const char *msg) {
+    // uart_puts automatically sends until '\0'
+    uart_puts(uart0, msg);
 
+    // Optionally send a newline so the other Pico knows the string ended
+    uart_putc(uart0, '\n');
+
+    printf("Sent to other Pico: %s\n", msg);
+}
 void print_morse_output(void) {
     if ((rand() % 6) + 1 == 6) play_theme();
     printf("\nMorse word: %s\n", morse_string);
@@ -190,13 +201,14 @@ void print_morse_output(void) {
 
     for (int i = 0; morse_string[i] != '\0'; i++) {
         if (morse_string[i] == '.') {
-            toggle_led(); sleep_ms(UNIT * DOT_UNITS);
-            toggle_led(); sleep_ms(UNIT);
+            toggle_led(); vTaskDelay(pdMS_TO_TICKS(UNIT * DOT_UNITS)); // FIX
+            toggle_led(); vTaskDelay(pdMS_TO_TICKS(UNIT));            // FIX (Inter-element gap)
         } else if (morse_string[i] == '-') {
-            toggle_led(); sleep_ms(UNIT * DASH_UNITS);
-            toggle_led(); sleep_ms(UNIT);
+            toggle_led(); vTaskDelay(pdMS_TO_TICKS(UNIT * DASH_UNITS)); // FIX
+            toggle_led(); vTaskDelay(pdMS_TO_TICKS(UNIT));             // FIX (Inter-element gap)
         } else if (morse_string[i] == ' ') {
-            sleep_ms(UNIT * WORD_GAP);
+            // Word gap: 7 units total, 1 unit is already accounted for by the preceding element
+            vTaskDelay(pdMS_TO_TICKS(UNIT * (WORD_GAP - 1)));         // FIX 
         }
     }
 }
@@ -214,12 +226,19 @@ static void btn_fxn(uint gpio, uint32_t eventMask) {
         }
     }
     if (gpio == BUTTON2) {
-        if (programMode == SENDING || programMode == DECODING) {
+        if (programMode == SENDING && usbMode==OFF) {
             programMode = RECEIVING;
             printf("Now receiving, use ASCII\n");
-        } else {
+        } else if(programMode==RECEIVING) {
             programMode = DECODING;
             printf("Now decoding, use Morse\n");
+        }else if(programMode==DECODING){
+            usbMode = ON;
+            programMode=SENDING;
+            printf("Now listening and sending to another pico device via UART\n");
+        }else if(usbMode==ON){
+            usbMode=OFF;
+            printf("Not listening or sending to another device.\n");
         }
     }
 }
@@ -240,8 +259,9 @@ static void sensor_task(void *arg) {
 
     for (;;) {
         if (programMode == SENDING) {
-            ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &temp);
+            ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &temp); 
             float pitch = calculate_pitch(ax, ay, az);
+            printf("X:%f,Y:%f,Z:%f \n",ax,ay,az);
             char symbol = morse_from_angle(pitch);
             printf("Pitch: %.2f  Symbol: %c\n", pitch, symbol);
 
@@ -282,6 +302,30 @@ void receive_task(void *arg) {
                 }
             }
         }
+        // ---- NEW: USB mode via UART ----
+        if (usbMode == ON) {
+            if (uart_is_readable(uart0)) {
+                int c = uart_getc(uart0);
+                if (c == '\r') continue;
+                if (c == '\n') {
+                    uart_rx_buffer[index] = '\0'; // Use the dedicated buffer
+                    printf("Received from other Pico: %s\n", uart_rx_buffer);
+                    
+                    // To display/output received data, you must copy it
+                    strncpy(morse_string, uart_rx_buffer, sizeof(morse_string));
+                    morse_string[sizeof(morse_string) - 1] = '\0';
+                    
+                    print_morse_output(); // Output the received Morse string
+
+                    index = 0;
+                } else if (index < sizeof(uart_rx_buffer) - 1) {
+                    uart_rx_buffer[index++] = (char)c;
+                } else {
+                    index = 0; // overflow protection
+                }
+            }
+}
+    
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -301,8 +345,12 @@ static void print_task(void *arg) {
                     morse_string[length + 1] = '\0';
                     printf("Symbol: %c  Buffer: %s\n", symbol, morse_string);
                 } else {
-                    if (length > 0) {
+                    if (length > 0 && usbMode!=ON) {
                         print_morse_output();
+                    }else if (length > 0 && usbMode==ON){
+                        morse_string[length]= '\r';
+                        send_string_to_pico(morse_string);
+
                     }
                     morse_string[0] = '\0';
                 }
@@ -326,6 +374,12 @@ int main(void) {
     gpio_set_irq_enabled_with_callback(BUTTON1, GPIO_IRQ_EDGE_FALL, true, btn_fxn);
     gpio_set_irq_enabled_with_callback(BUTTON2, GPIO_IRQ_EDGE_FALL, true, btn_fxn);
     init_buzzer();
+    uart_init(uart0, 115200);
+
+    // Configure GPIO pins for UART0
+    gpio_set_function(0, GPIO_FUNC_UART); // GP0 = TX
+    gpio_set_function(1, GPIO_FUNC_UART); // GP1 = RX
+
 
     morseQueue = xQueueCreate(10, sizeof(char));
     if (morseQueue == NULL) {
