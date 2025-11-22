@@ -76,7 +76,7 @@ const MorseEntry morse_table[] = {
     {'"', ".-..-."}, {'$', "...-..-"}, {'@', ".--.-."}
 };
 
-// -------------------- Function Headers --------------------
+// -------------------- Function Headers -------------------- (TASK 1,2,3)
 /** Convert character to Morse code string */
 const char* to_morse(char c);
 
@@ -116,7 +116,7 @@ static void print_task(void *arg);
 /** Main entry point */
 int main(void);
 
-// -------------------- Functions --------------------
+// -------------------- Functions -------------------- (NEED TO ADD)
 
 // Convert a single ASCII character to its Morse string
 const char* to_morse(char c) {
@@ -145,7 +145,7 @@ char from_morse(const char* code) {
     return '?'; // Unknown symbol
 }
 
-// Decode a full Morse string into ASCII text
+// Decode a full Morse string into ASCII text 
 void decode_from_morse(const char* morse_input, char* output_buffer) {
     output_buffer[0] = '\0';  // Clear output buffer
     char token[10];            // Temporary buffer for one Morse letter
@@ -167,14 +167,14 @@ void decode_from_morse(const char* morse_input, char* output_buffer) {
     output_buffer[out_index] = '\0'; // Null-terminate final string
 }
 
-// Convert IMU pitch angle to Morse symbol
+// Convert IMU pitch angle to Morse symbol (TASK 1)
 char morse_from_angle(float angle) {
     if (angle > ANGLE_THRESHOLD) return '-';   // Dash for positive tilt
     else if (angle < -ANGLE_THRESHOLD) return '.'; // Dot for negative tilt
     else return ' ';                           // Neutral, no symbol
 }
 
-// Play a short buzzer melody
+// Play a short buzzer melody 
 void play_theme(void) {
     buzzer_play_tone(659, 150); vTaskDelay(pdMS_TO_TICKS(50));
     buzzer_play_tone(784, 150); vTaskDelay(pdMS_TO_TICKS(50));
@@ -185,7 +185,7 @@ void play_theme(void) {
     buzzer_play_tone(659, 300);
 }
 
-// Send a string to the other Pico via UART
+// Send a string to the other Pico via UART (TASK 3)
 void send_string_to_pico(const char *msg) {
 
     uart_puts(uart0, msg);     // Send full string over UART
@@ -193,6 +193,7 @@ void send_string_to_pico(const char *msg) {
 
     printf("Sent to other Pico: %s\n", msg);  // Debug print to USB terminal
 }
+// Print Morse string to OLED, LED, and buzzer (TASK 2)
 void print_morse_output(void) {
    if ((rand() % 3) == 0)  play_theme();
     printf("\nMorse word: %s\n", morse_string);
@@ -216,8 +217,8 @@ void print_morse_output(void) {
 float calculate_pitch(float ax, float ay, float az) {
     return atan2f(ax, sqrtf(ay * ay + az * az)) * 180.0f / M_PI; // Convert to degrees
 }
-
-// Handles BUTTON1 and BUTTON2 presses
+// -------------------- Button Interrupt Handler -------------------- (TASK 2 and 3)
+// Handles BUTTON1 and BUTTON2 presses 
 static void btn_fxn(uint gpio, uint32_t eventMask) {
     if (gpio == BUTTON1) {
         programState = RUNNING;          // Set state to running
@@ -255,7 +256,7 @@ if (gpio == BUTTON2) {                                 // If BUTTON2 pressed
 
 // -------------------- Sensor Task --------------------
 
-// Reads IMU, calculates pitch, and sends Morse symbols
+// Reads IMU, calculates pitch, and sends Morse symbols (TASK 1)
 static void sensor_task(void *arg) {
     (void)arg;
     float ax, ay, az, gx, gy, gz, temp;
@@ -286,8 +287,8 @@ static void sensor_task(void *arg) {
     }
 }
 
-
-void receive_task(void *arg) {
+// (TASK 2)
+void receive_task(void *arg) {                               
     (void)arg;                                                    // Unused parameter
     size_t index = 0;                                             // Buffer write position
 
@@ -316,7 +317,7 @@ void receive_task(void *arg) {
             }
         }
 
-        // ---- USB MODE: UART communication with the other Pico ----
+        // ---- USB MODE: UART communication with the other Pico ---- (TASK 3)
         if (usbMode == ON) {
             if (uart_is_readable(uart0)) {                       // Check if UART has data
                 int c = uart_getc(uart0);                        // Read one byte
@@ -342,7 +343,7 @@ void receive_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(10));                           // Small pause so task yields
     }
 }
-
+// -------------------- Print Task -------------------- (TASK 2 and 3)
 static void print_task(void *arg) {
     (void)arg;                                   
     char symbol;                                 // Symbol received from the queue
@@ -372,7 +373,7 @@ static void print_task(void *arg) {
 }
 
 
-// -------------------- Main Function --------------------
+// -------------------- Main Function -------------------- (TASK 1,2,3)
 
 // Program entry point
 int main(void) {
