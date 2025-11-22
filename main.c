@@ -340,63 +340,162 @@ static void sensor_task(void *arg) {
 }
 
 // (Tier 2)
-void receive_task(void *arg) {                               
-    (void)arg;                                                    // Unused parameter
-    size_t index = 0;                                             // Buffer write position
+// ...existing code...
+void receive_task(void *arg) {
+    (void)arg;
+    size_t usb_index = 0;   // USB (stdio) buffer write position
+    size_t uart_index = 0;  // UART buffer write position
+
+    // Ensure buffers are initialized
+    input_buffer[0] = '\0';
+    uart_rx_buffer[0] = '\0';
 
     while (1) {
-        if (programMode == RECEIVING || programMode == DECODING) {
-            int c = getchar_timeout_us(0);                        // Read USB input (non-blocking)
+        // --- USB input (commands / ASCII / Morse) ---
+        {
+            int c = getchar_timeout_us(0); // non-blocking read from USB stdio
             if (c != PICO_ERROR_TIMEOUT) {
-                if (c == '\r') continue;                         // Ignore carriage return
-                if (c == '\n') {                                 // End of message
-                    input_buffer[index] = '\0';                  // Close the string
+                if (c == '\r') {
+                    /* ignore CR */
+                } else if (c == '\n') {
+                    input_buffer[usb_index] = '\0';
 
-                    if (programMode == RECEIVING) {
-                        encode_to_morse(input_buffer);           // Turn text → Morse
+                    // Global commands handled from USB regardless of mode
+                    if (strcmp(input_buffer, ".clear") == 0) {
+                        printf("\x1b[2J\x1b[H"); // ANSI clear
+                        usb_index = 0;
+                        input_buffer[0] = '\0';
+                    } else if (strcmp(input_buffer, ".exit") == 0) {
+                        printf("Exiting program...\n");
+                        vTaskEndScheduler(); // attempt to stop FreeRTOS
+                        exit(0);
+                    } else if (programMode == RECEIVING) {
+                        // ASCII -> Morse, support verbatim sections __...__
+                        morse_string[0] = '\0';
+                        const char *p = input_buffer;
+                        while (*p) {
+                            if (p[0] == '_' && p[1] == '_') {
+                                p += 2;
+                                while (*p && !(p[0] == '_' && p[1] == '_')) {
+                                    size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                    if (rem > 0) strncat(morse_string, p, 1);
+                                    p++;
+                                }
+                                if (*p) p += 2;
+                                size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                if (rem > 0) strncat(morse_string, " ", rem);
+                                continue;
+                            }
+
+                            if (isspace((unsigned char)*p)) {
+                                size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                if (rem >= 2) strncat(morse_string, "  ", rem);
+                                p++;
+                                continue;
+                            }
+
+                            const char *m = to_morse(*p++);
+                            if (m[0]) {
+                                size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                if (rem > 0) strncat(morse_string, m, rem);
+                                rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                if (rem > 0) strncat(morse_string, " ", rem);
+                            }
+                        }
                         print_morse_output();
-                        morse_string[0] = '\0';                      // Show Morse and flash LED
+                        morse_string[0] = '\0';
                     } else if (programMode == DECODING) {
-                        decode_from_morse(input_buffer, morse_string); // Turn Morse → text
-                        printf("Decoded: %s\n", morse_string);   // Print the result
-                        print_morse_output();         
-                        morse_string[0] = '\0';             // Flash LED + display
+                        // Morse -> ASCII, support verbatim __...__
+                        if (strstr(input_buffer, "__")) {
+                            morse_string[0] = '\0';
+                            const char *p = input_buffer;
+                            while (*p) {
+                                if (p[0] == '_' && p[1] == '_') {
+                                    p += 2;
+                                    while (*p && !(p[0] == '_' && p[1] == '_')) {
+                                        size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                        if (rem > 0) strncat(morse_string, p, 1);
+                                        p++;
+                                    }
+                                    if (*p) p += 2;
+                                    continue;
+                                }
+
+                                char token[10] = {0};
+                                size_t ti = 0;
+                                while (*p && *p != ' ' && ti < sizeof(token) - 1) token[ti++] = *p++;
+                                token[ti] = '\0';
+                                if (ti > 0) {
+                                    char dec = from_morse(token);
+                                    size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                    if (rem > 0) {
+                                        char tmp[2] = { dec, '\0' };
+                                        strncat(morse_string, tmp, rem);
+                                    }
+                                }
+
+                                int sp = 0;
+                                while (*p == ' ') { sp++; p++; }
+                                if (sp >= 2) {
+                                    size_t rem = sizeof(morse_string) - strlen(morse_string) - 1;
+                                    if (rem > 0) strncat(morse_string, " ", rem);
+                                }
+                            }
+                        } else {
+                            decode_from_morse(input_buffer, morse_string);
+                        }
+                        printf("Decoded: %s\n", morse_string);
+                        print_morse_output();
+                        morse_string[0] = '\0';
                     }
-                    index = 0;                                   // Reset buffer
-                } else if (index < sizeof(input_buffer) - 1) {
-                    input_buffer[index++] = (char)c;             // Add char to buffer
+
+                    usb_index = 0;
+                    input_buffer[0] = '\0';
                 } else {
-                    index = 0;                                   // Reset if buffer overflows
+                    if (usb_index < sizeof(input_buffer) - 1) {
+                        input_buffer[usb_index++] = (char)c;
+                    } else {
+                        // overflow: reset
+                        usb_index = 0;
+                        input_buffer[0] = '\0';
+                    }
                 }
             }
         }
 
-        // ---- USB MODE: UART communication with the other Pico ---- (Tier 3)
+        // --- UART input from other Pico (when enabled) ---
         if (uartMode == ON) {
-            if (uart_is_readable(uart0)) {                       // Check if UART has data
-                int c = uart_getc(uart0);                        // Read one byte
-                if (c == '\r') continue;                         // Ignore Carriage Return
-                if (c == '\n') {                                 // Full message received
-                    uart_rx_buffer[index] = '\0';                // Close the UART string
+            if (uart_is_readable(uart0)) {
+                int c = uart_getc(uart0);
+                if (c == '\r') {
+                    /* ignore */
+                } else if (c == '\n') {
+                    uart_rx_buffer[uart_index] = '\0';
                     printf("Received from other Pico: %s\n", uart_rx_buffer);
 
-                    strncpy(morse_string, uart_rx_buffer, sizeof(morse_string)); // Copy safely
-                    morse_string[sizeof(morse_string) - 1] = '\0';              // Ensure end
+                    // Copy safely into morse_string and display
+                    strncpy(morse_string, uart_rx_buffer, sizeof(morse_string));
+                    morse_string[sizeof(morse_string) - 1] = '\0';
+                    print_morse_output();
+                    morse_string[0] = '\0';
 
-                    print_morse_output();                        // Show Morse from other Pico
-
-                    index = 0;                                   // Reset for next message
-                } else if (index < sizeof(uart_rx_buffer) - 1) {
-                    uart_rx_buffer[index++] = (char)c;           // Store UART character
+                    uart_index = 0;
+                    uart_rx_buffer[0] = '\0';
                 } else {
-                    index = 0;                                   // Reset if buffer fills
+                    if (uart_index < sizeof(uart_rx_buffer) - 1) {
+                        uart_rx_buffer[uart_index++] = (char)c;
+                    } else {
+                        uart_index = 0;
+                        uart_rx_buffer[0] = '\0';
+                    }
                 }
             }
         }
-    
-        vTaskDelay(pdMS_TO_TICKS(10));                           // Small pause so task yields
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
+// ...existing
 // -------------------- Print Task -------------------- (Tier 2 and 3)
 static void print_task(void *arg) {
     (void)arg;                                   
